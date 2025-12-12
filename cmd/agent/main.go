@@ -1,212 +1,177 @@
 package main
 
 import (
-    "encoding/json"
-    "flag"
-    "fmt"
-    "log"
-    "os"
-    "os/signal"
-    "syscall"
-    "time"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
-    "isp-agent/pkg/hwid"
-    "isp-agent/pkg/license"
-    "isp-agent/pkg/nginx"
-    "isp-agent/pkg/telemetry"
+	"isp-agent/pkg/hwid"
+	"isp-agent/pkg/license"
+	"isp-agent/pkg/nginx"
+	"isp-agent/pkg/telemetry"
+	"isp-agent/pkg/updater"
 )
 
-const Version = "1.0.0"
-
-type Config struct {
-    SaasURL      string `json:"saas_url"`
-    LicenseKey   string `json:"license_key"`
-    ISPName      string `json:"isp_name"`
-    ServerIP     string `json:"server_ip"`
-    HWID         string `json:"hwid"`
-    ISPID        int    `json:"isp_id"`
-    TelemetryInt int    `json:"telemetry_interval_seconds"`
-}
-
-var config Config
+const VERSION = "1.0.0"
+const SAAS_URL = "http://64.23.151.140:8080"
 
 func main() {
-    log.Printf("ISP Cache Agent v%s starting...", Version)
-    
-    // Parse flags
-    configPath := flag.String("config", "/etc/isp-agent/config.json", "Path to config file")
-    install := flag.Bool("install", false, "Install and register agent")
-    flag.Parse()
-    
-    // Load or create config
-    if *install {
-        if err := installAgent(); err != nil {
-            log.Fatalf("Installation failed: %v", err)
-        }
-        log.Println("Agent installed successfully!")
-        return
-    }
-    
-    // Load existing config
-    if err := loadConfig(*configPath); err != nil {
-        log.Fatalf("Failed to load config: %v. Run with -install flag to install.", err)
-    }
-    
-    // Validate license
-    log.Println("Validating license...")
-    licenseInfo, err := license.Validate(config.SaasURL, config.LicenseKey, config.HWID)
-    if err != nil {
-        log.Fatalf("License validation failed: %v", err)
-    }
-    
-    if license.IsExpired(licenseInfo.ExpiresAt) {
-        log.Fatalf("License has expired: %s", licenseInfo.ExpiresAt)
-    }
-    
-    log.Printf("License valid until: %s", licenseInfo.ExpiresAt)
-    log.Printf("Enabled modules: %v", licenseInfo.Modules)
-    config.ISPID = licenseInfo.ISPID
-    
-    // Start telemetry loop
-    log.Printf("Starting telemetry collection (every %d seconds)...", config.TelemetryInt)
-    
-    stopChan := make(chan os.Signal, 1)
-    signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
-    
-    ticker := time.NewTicker(time.Duration(config.TelemetryInt) * time.Second)
-    defer ticker.Stop()
-    
-    // Send initial telemetry
-    collectAndSend()
-    
-    // Main loop
-    for {
-        select {
-        case <-ticker.C:
-            collectAndSend()
-        case <-stopChan:
-            log.Println("Shutting down gracefully...")
-            return
-        }
-    }
-}
+	// Command-line flags
+	installFlag := flag.Bool("install", false, "Run initial installation and registration")
+	hwidFlag := flag.Bool("hwid", false, "Generate and display hardware ID only")
+	versionFlag := flag.Bool("version", false, "Display version information")
+	checkUpdateFlag := flag.Bool("check-update", false, "Check for available updates")
+	flag.Parse()
 
-func collectAndSend() {
-    // Collect cache stats
-    cacheStats, err := nginx.GetCacheStats("")
-    if err != nil {
-        log.Printf("Failed to collect cache stats: %v", err)
-        return
-    }
-    
-    // Collect system stats
-    sysStats, err := nginx.GetSystemStats()
-    if err != nil {
-        log.Printf("Failed to collect system stats: %v", err)
-        sysStats = &nginx.SystemStats{}
-    }
-    
-    // Estimate bandwidth saved (hits * average file size)
-    avgFileSize := int64(2) // 2 MB average
-    bandwidthSaved := (cacheStats.Hits * avgFileSize)
-    
-    // Send telemetry
-    data := telemetry.TelemetryData{
-        ISPID:          config.ISPID,
-        CacheHits:      cacheStats.Hits,
-        CacheMisses:    cacheStats.Misses,
-        BandwidthSaved: bandwidthSaved,
-        TotalRequests:  cacheStats.TotalRequests,
-        CacheSizeUsed:  int(cacheStats.CacheSizeUsed),
-        CPUUsage:       sysStats.CPUUsage,
-        MemoryUsage:    sysStats.MemoryUsage,
-    }
-    
-    if err := telemetry.Send(config.SaasURL, data); err != nil {
-        log.Printf("Failed to send telemetry: %v", err)
-        return
-    }
-    
-    log.Printf("Telemetry sent: Hits=%d, Misses=%d, HitRate=%.2f%%, CacheSize=%dMB",
-        data.CacheHits, data.CacheMisses,
-        float64(data.CacheHits)/float64(data.TotalRequests)*100,
-        data.CacheSizeUsed)
-    
-    // Collect and send top domains
-    domains, err := nginx.GetTopDomains("", 20)
-    if err == nil {
-        for domain, hits := range domains {
-            siteData := telemetry.SiteData{
-                ISPID:          config.ISPID,
-                Domain:         domain,
-                Hits:           hits,
-                BandwidthSaved: hits * avgFileSize,
-            }
-            telemetry.SendCachedSite(config.SaasURL, siteData)
-        }
-    }
-}
+	// Handle version flag
+	if *versionFlag {
+		fmt.Printf("ISP SaaS Agent v%s\n", VERSION)
+		os.Exit(0)
+	}
 
-func installAgent() error {
-    var saasURL, licenseKey, ispName, serverIP string
-    
-    fmt.Print("Enter SaaS Platform URL (e.g., http://64.23.151.140): ")
-    fmt.Scanln(&saasURL)
-    
-    fmt.Print("Enter License Key: ")
-    fmt.Scanln(&licenseKey)
-    
-    fmt.Print("Enter ISP Name: ")
-    fmt.Scanln(&ispName)
-    
-    fmt.Print("Enter Server IP: ")
-    fmt.Scanln(&serverIP)
-    
-    // Generate HWID
-    hwid, err := hwid.GetOrCreate()
-    if err != nil {
-        return fmt.Errorf("failed to generate HWID: %w", err)
-    }
-    
-    log.Printf("Hardware ID: %s", hwid)
-    
-    // Validate license
-    log.Println("Validating license...")
-    licenseInfo, err := license.Validate(saasURL, licenseKey, hwid)
-    if err != nil {
-        return fmt.Errorf("license validation failed: %w", err)
-    }
-    
-    log.Printf("License validated! ISP ID: %d", licenseInfo.ISPID)
-    
-    // Save config
-    config = Config{
-        SaasURL:      saasURL,
-        LicenseKey:   licenseKey,
-        ISPName:      ispName,
-        ServerIP:     serverIP,
-        HWID:         hwid,
-        ISPID:        licenseInfo.ISPID,
-        TelemetryInt: 60, // 1 minute
-    }
-    
-    os.MkdirAll("/etc/isp-agent", 0755)
-    
-    configJSON, _ := json.MarshalIndent(config, "", "  ")
-    if err := os.WriteFile("/etc/isp-agent/config.json", configJSON, 0644); err != nil {
-        return fmt.Errorf("failed to save config: %w", err)
-    }
-    
-    license.SaveConfig(licenseKey)
-    
-    return nil
-}
+	// Handle HWID flag
+	if *hwidFlag {
+		id, err := hwid.Generate()
+		if err != nil {
+			log.Fatalf("Failed to generate hardware ID: %v", err)
+		}
+		fmt.Println(id)
+		os.Exit(0)
+	}
 
-func loadConfig(path string) error {
-    data, err := os.ReadFile(path)
-    if err != nil {
-        return err
-    }
-    
-    return json.Unmarshal(data, &config)
+	// Handle check-update flag
+	if *checkUpdateFlag {
+		version, needsUpdate, err := updater.CheckForUpdates(SAAS_URL)
+		if err != nil {
+			log.Fatalf("Update check failed: %v", err)
+		}
+		
+		fmt.Printf("Current version: %s\n", VERSION)
+		fmt.Printf("Latest version: %s\n", version.Version)
+		
+		if needsUpdate {
+			fmt.Println("✓ Update available!")
+			fmt.Printf("  Release notes: %s\n", version.ReleaseNotes)
+			fmt.Printf("\nTo update, run: sudo systemctl stop isp-agent && wget %s -O /opt/isp-agent/isp-agent && sudo systemctl start isp-agent\n", version.DownloadURL)
+		} else {
+			fmt.Println("✓ You are running the latest version")
+		}
+		os.Exit(0)
+	}
+
+	// Load license key from config
+	licenseKey, err := license.LoadConfig()
+	if err != nil {
+		log.Fatalf("Failed to load license config: %v. Run with -install flag first.", err)
+	}
+
+	// Get hardware ID
+	hardwareID, err := hwid.GetOrCreate()
+	if err != nil {
+		log.Fatalf("Failed to get hardware ID: %v", err)
+	}
+
+	// Installation mode
+	if *installFlag {
+		fmt.Println("=== ISP Agent Installation ===")
+		fmt.Printf("Hardware ID: %s\n", hardwareID)
+		fmt.Printf("License Key: %s\n", licenseKey)
+
+		// Validate license
+		licenseInfo, err := license.Validate(SAAS_URL, licenseKey, hardwareID)
+		if err != nil {
+			log.Fatalf("License validation failed: %v", err)
+		}
+
+		if licenseInfo.Status != "active" {
+			log.Fatal("License is not active")
+		}
+
+		fmt.Println("✓ License validated successfully")
+		fmt.Printf("✓ ISP ID: %d\n", licenseInfo.ISPID)
+		fmt.Printf("✓ Expires: %s\n", licenseInfo.ExpiresAt)
+		fmt.Println("✓ Installation complete")
+		fmt.Println("\nStart the agent with: systemctl start isp-agent")
+		os.Exit(0)
+	}
+
+	// Normal operation mode
+	log.Printf("ISP SaaS Agent v%s starting...", VERSION)
+	log.Printf("Hardware ID: %s", hardwareID)
+	log.Printf("License Key: %s", licenseKey)
+
+	// Validate license at startup
+	licenseInfo, err := license.Validate(SAAS_URL, licenseKey, hardwareID)
+	if err != nil {
+		log.Fatalf("License validation failed: %v", err)
+	}
+
+	if licenseInfo.Status != "active" {
+		log.Fatal("License is not active")
+	}
+
+	log.Printf("License validated successfully (ISP ID: %d)", licenseInfo.ISPID)
+
+	// Check for updates on startup
+	go func() {
+		time.Sleep(30 * time.Second) // Wait 30s after startup
+		version, needsUpdate, err := updater.CheckForUpdates(SAAS_URL)
+		if err != nil {
+			log.Printf("Update check failed: %v", err)
+			return
+		}
+		
+		if needsUpdate {
+			log.Printf("New version available: %s (current: %s)", version.Version, VERSION)
+			log.Printf("Update will be installed automatically")
+			
+			if err := updater.DownloadAndInstall(version); err != nil {
+				log.Printf("Auto-update failed: %v", err)
+			}
+		}
+	}()
+
+	// Start auto-update checker (every 24 hours)
+	go updater.StartUpdateLoop(SAAS_URL, 24*time.Hour)
+
+	// Start telemetry loop in background
+	collectStats := func() (*telemetry.TelemetryData, error) {
+		cacheStats, err := nginx.GetCacheStats("/var/log/nginx/access.log")
+		if err != nil {
+			return nil, err
+		}
+		
+		systemStats, err := nginx.GetSystemStats()
+		if err != nil {
+			return nil, err
+		}
+
+		return &telemetry.TelemetryData{
+			ISPID:          licenseInfo.ISPID,
+			CacheHits:      cacheStats.Hits,
+			CacheMisses:    cacheStats.Misses,
+			BandwidthSaved: cacheStats.BytesServed / (1024 * 1024), // Convert to MB
+			TotalRequests:  cacheStats.TotalRequests,
+			CacheSizeUsed:  int(cacheStats.CacheSizeUsed / (1024 * 1024)), // Convert to MB
+			CPUUsage:       systemStats.CPUUsage,
+			MemoryUsage:    systemStats.MemoryUsage,
+		}, nil
+	}
+
+	go telemetry.StartTelemetryLoop(licenseKey, licenseInfo.ISPID, 5*time.Minute, collectStats)
+
+	// Handle graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	log.Println("Agent running. Press Ctrl+C to stop.")
+	<-sigChan
+
+	log.Println("Shutting down gracefully...")
+	time.Sleep(2 * time.Second)
+	log.Println("Agent stopped")
 }
