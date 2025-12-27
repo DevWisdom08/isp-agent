@@ -102,13 +102,28 @@ func StartTelemetryLoop(saasURL string, ispID int, interval time.Duration, colle
     ticker := time.NewTicker(interval)
     defer ticker.Stop()
     
+    // Send initial telemetry immediately
+    sendTelemetry(saasURL, ispID, collectFunc)
+    
     for range ticker.C {
-        data, err := collectFunc()
-        if err != nil {
-            continue
-        }
-        
-        data.ISPID = ispID
+        sendTelemetry(saasURL, ispID, collectFunc)
+    }
+}
+
+// sendTelemetry collects and sends telemetry data with logging
+func sendTelemetry(saasURL string, ispID int, collectFunc func() (*TelemetryData, error)) {
+    data, err := collectFunc()
+    if err != nil {
+        // Log but don't fail - collect what we can
+        data = &TelemetryData{}
+    }
+    
+    data.ISPID = ispID
+    
+    // Ensure we always send something
+    if err := Send(saasURL, *data); err != nil {
+        // Retry once after a short delay
+        time.Sleep(5 * time.Second)
         Send(saasURL, *data)
     }
 }

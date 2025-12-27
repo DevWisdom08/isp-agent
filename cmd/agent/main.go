@@ -140,7 +140,13 @@ func main() {
 
 	// Start telemetry loop in background
 	collectStats := func() (*telemetry.TelemetryData, error) {
-		cacheStats, err := nginx.GetCacheStats("/var/log/nginx/access.log")
+		// Try cache.log first, fallback to access.log
+		logPath := "/var/log/nginx/cache.log"
+		if _, err := os.Stat(logPath); os.IsNotExist(err) {
+			logPath = "/var/log/nginx/access.log"
+		}
+		
+		cacheStats, err := nginx.GetCacheStats(logPath)
 		if err != nil {
 			return nil, err
 		}
@@ -162,7 +168,7 @@ func main() {
 		}, nil
 	}
 
-	go telemetry.StartTelemetryLoop(licenseKey, licenseInfo.ISPID, 5*time.Minute, collectStats)
+	go telemetry.StartTelemetryLoop(SAAS_URL, licenseInfo.ISPID, 5*time.Minute, collectStats)
 
 	// Handle graceful shutdown
 	sigChan := make(chan os.Signal, 1)
